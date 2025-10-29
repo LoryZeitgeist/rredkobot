@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./presets:/app/presets
+    restart: unless-stopped

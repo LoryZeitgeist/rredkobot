@@ -1,0 +1,24 @@
+{
+  "name": "anya_redko",
+  "description": "Ответы для фразы 'аня редко'",
+  "triggers": [
+    {
+      "phrase": "аня редко",
+      "keywords": [
+        "аня",
+        "редко"
+      ],
+      "images": [
+        "anya_redko_1.jpg",
+        "anya_redko_2.jpg",
+        "anya_redko_3.jpg",
+        "anya_redko_4.jpg",
+        "anya_redko_5.jpg",
+        "anya_redko_6.jpg",
+        "anya_redko_7.jpg",
+        "anya_redko_8.jpg",
+        "anya_redko_9.jpg"
+      ]
+    }
+  ]
+}

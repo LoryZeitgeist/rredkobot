@@ -1,0 +1,28 @@
+{
+  "name": "sample",
+  "description": "Example preset. Replace with your own phrases and images.",
+  "triggers": [
+    {
+      "phrase": "милые котики",
+      "keywords": [
+        "милые",
+        "котики"
+      ],
+      "images": [
+        "REPLACE_WITH_FILE_ID_OR_URL_1",
+        "REPLACE_WITH_FILE_ID_OR_URL_2"
+      ]
+    },
+    {
+      "phrase": "весёлые собачки",
+      "keywords": [
+        "весёлые",
+        "собачки"
+      ],
+      "images": [
+        "REPLACE_WITH_FILE_ID_OR_URL_3",
+        "REPLACE_WITH_FILE_ID_OR_URL_4"
+      ]
+    }
+  ]
+}

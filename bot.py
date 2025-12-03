@@ -33,8 +33,10 @@ from telegram.ext import (
     filters,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+ENV_FILE_PATH = PROJECT_ROOT / ".env"
 
-load_dotenv()
+load_dotenv(dotenv_path=ENV_FILE_PATH)
 
 logger = logging.getLogger("bot")
 
@@ -45,12 +47,21 @@ ADMIN_IDS = {
     if admin_id.strip().isdigit()
 }
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-PRESETS_DIR = Path(os.environ.get("PRESETS_DIR", "/app/presets")).resolve()
-STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/chat_presets.json")).resolve()
-ENV_FILE_PATH = Path(".env").resolve()
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 ALLOWED_ARCHIVE_EXTENSIONS = {".zip"}
 PRESET_FILE_MAP: Dict[str, Path] = {}
+
+
+def resolve_project_path(value: Optional[str], default_relative: str) -> Path:
+    raw_value = (value or "").strip()
+    path = Path(raw_value).expanduser() if raw_value else Path(default_relative)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+PRESETS_DIR = resolve_project_path(os.environ.get("PRESETS_DIR"), "presets")
+STATE_FILE = resolve_project_path(os.environ.get("STATE_FILE"), "data/chat_presets.json")
 
 CMD_START = "start"
 CMD_HELP = "spravka"

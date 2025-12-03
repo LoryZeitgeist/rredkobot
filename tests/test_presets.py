@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 
 class PresetImagesTestCase(unittest.TestCase):
@@ -70,6 +71,33 @@ class PresetImagesTestCase(unittest.TestCase):
         self.assertNotIn("sample.json", returned)
 
 
+class PathResolutionTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_presets_dir = os.environ.get("PRESETS_DIR")
+        self.original_state_file = os.environ.get("STATE_FILE")
+
+    def tearDown(self) -> None:
+        self._restore_env("PRESETS_DIR", self.original_presets_dir)
+        self._restore_env("STATE_FILE", self.original_state_file)
+
+    def _restore_env(self, name: str, value: Optional[str]) -> None:
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+    def test_relative_paths_resolve_from_project_root(self) -> None:
+        os.environ["PRESETS_DIR"] = "relative_presets"
+        os.environ["STATE_FILE"] = "relative_state/state.json"
+        bot_module = importlib.reload(importlib.import_module("bot"))
+        project_root = Path(bot_module.__file__).resolve().parent
+
+        self.assertEqual(bot_module.PRESETS_DIR, (project_root / "relative_presets").resolve())
+        self.assertEqual(
+            bot_module.STATE_FILE,
+            (project_root / "relative_state/state.json").resolve(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,23 +1,54 @@
 {
   "name": "anya_redko",
-  "description": "Ответы для фразы 'аня редко'",
+  "description": "Ответы для фразы «моремиров»",
   "triggers": [
     {
-      "phrase": "аня редко",
+      "phrase": "моремиров",
       "keywords": [
-        "аня",
-        "редко"
+        "моремиров"
       ],
       "images": [
-        "anya_redko_1.jpg",
-        "anya_redko_2.jpg",
-        "anya_redko_3.jpg",
-        "anya_redko_4.jpg",
-        "anya_redko_5.jpg",
-        "anya_redko_6.jpg",
-        "anya_redko_7.jpg",
-        "anya_redko_8.jpg",
-        "anya_redko_9.jpg"
+        "anya_redko_20251127_221021_zip_1_берег_и_причал.jpg",
+        "anya_redko_20251127_221021_zip_2_бери_свое.jpg",
+        "anya_redko_20251127_221021_zip_3_внутри_тебя.jpg",
+        "anya_redko_20251127_221021_zip_4_волн_полное_сердце.jpg",
+        "anya_redko_20251127_221021_zip_5_все_позади.jpg",
+        "anya_redko_20251127_221021_zip_6_вышли_из_берегов.jpg",
+        "anya_redko_20251127_221021_zip_7_главное_выстоять.jpg",
+        "anya_redko_20251127_221021_zip_8_глубина.jpg",
+        "anya_redko_20251127_221021_zip_9_доспехи.jpg",
+        "anya_redko_20251127_221021_zip_10_душа_твоя.jpg",
+        "anya_redko_20251127_221021_zip_11_за_стеклом.jpg",
+        "anya_redko_20251127_221021_zip_12_заводь.jpg",
+        "anya_redko_20251127_221021_zip_13_кит.jpg",
+        "anya_redko_20251127_221021_zip_14_ключ_сокрыт.jpg",
+        "anya_redko_20251127_221021_zip_15_корабль.jpg",
+        "anya_redko_20251127_221021_zip_16_кто_умеет_летать.jpg",
+        "anya_redko_20251127_221021_zip_17_море_придет.jpg",
+        "anya_redko_20251127_221021_zip_18_на_корм_рыбам.jpg",
+        "anya_redko_20251127_221021_zip_19_надежда.jpg",
+        "anya_redko_20251127_221021_zip_20_направление.jpg",
+        "anya_redko_20251127_221021_zip_21_непослушные.jpg",
+        "anya_redko_20251127_221021_zip_22_останься.jpg",
+        "anya_redko_20251127_221021_zip_23_петля_для_пирата.jpg",
+        "anya_redko_20251127_221021_zip_24_погружение.jpg",
+        "anya_redko_20251127_221021_zip_25_послание.jpg",
+        "anya_redko_20251127_221021_zip_26_поцелуйте.jpg",
+        "anya_redko_20251127_221021_zip_27_путь.jpg",
+        "anya_redko_20251127_221021_zip_28_рубашка.jpg",
+        "anya_redko_20251127_221021_zip_29_рыбы_поют.jpg",
+        "anya_redko_20251127_221021_zip_30_связь.jpg",
+        "anya_redko_20251127_221021_zip_31_сокровище.jpg",
+        "anya_redko_20251127_221021_zip_32_стая.jpg",
+        "anya_redko_20251127_221021_zip_33_течение.jpg",
+        "anya_redko_20251127_221021_zip_34_топить.jpg",
+        "anya_redko_20251127_221021_zip_35_топь.jpg",
+        "anya_redko_20251127_221021_zip_36_три_глаза.jpg",
+        "anya_redko_20251127_221021_zip_37_ты_дома.jpg",
+        "anya_redko_20251127_221021_zip_38_улов.jpg",
+        "anya_redko_20251127_221021_zip_39_фитиль.jpg",
+        "anya_redko_20251127_221021_zip_40_через_край.jpg",
+        "anya_redko_20251127_221021_zip_41_чешуя.jpg"
       ]
     }
   ]

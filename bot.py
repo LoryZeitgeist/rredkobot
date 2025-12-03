@@ -3,9 +3,13 @@ import logging
 import os
 import platform
 import random
+import shutil
+import tempfile
+import zipfile
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telegram import (
@@ -44,6 +48,9 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 PRESETS_DIR = Path(os.environ.get("PRESETS_DIR", "/app/presets")).resolve()
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/chat_presets.json")).resolve()
 ENV_FILE_PATH = Path(".env").resolve()
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+ALLOWED_ARCHIVE_EXTENSIONS = {".zip"}
+PRESET_FILE_MAP: Dict[str, Path] = {}
 
 CMD_START = "start"
 CMD_HELP = "spravka"
@@ -133,6 +140,7 @@ def log_startup_diagnostics(presets: Dict[str, Dict[str, Any]], state: Dict[str,
 
 def load_presets() -> Dict[str, Dict[str, Any]]:
     presets: Dict[str, Dict[str, Any]] = {}
+    PRESET_FILE_MAP.clear()
 
     if not PRESETS_DIR.exists():
         logger.warning("Preset directory %s not found.", PRESETS_DIR)
@@ -143,6 +151,7 @@ def load_presets() -> Dict[str, Dict[str, Any]]:
             preset_data = json.loads(preset_path.read_text(encoding="utf-8"))
             name = preset_data.get("name") or preset_path.stem
             presets[name] = preset_data
+            PRESET_FILE_MAP[name] = preset_path
         except json.JSONDecodeError as exc:
             logger.error("Failed to parse preset %s: %s", preset_path, exc)
 
@@ -238,12 +247,12 @@ def find_matching_trigger(
                 seen.add(keyword)
                 keywords.append(keyword)
 
-        if len(keywords) < 2:
-            logger.debug("Trigger %s skipped: требуется минимум два ключевых слова.", trigger)
+        if not keywords:
+            logger.debug("Trigger %s skipped: нет доступных ключевых слов или фразы.", trigger)
             continue
 
         matches = sum(1 for keyword in keywords if keyword in normalized_message)
-        min_matches = max(2, calculate_min_matches(keywords, trigger.get("min_matches")))
+        min_matches = calculate_min_matches(keywords, trigger.get("min_matches"))
         if matches >= min_matches:
             return {
                 "trigger": trigger,
@@ -332,43 +341,384 @@ def ensure_presets_directory() -> None:
     PRESETS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def get_preset_file_path(preset_name: str) -> Optional[Path]:
+    preset_path = PRESET_FILE_MAP.get(preset_name)
+    if preset_path and preset_path.exists():
+        return preset_path
+    logger.error("Preset file for %s not found. Known presets: %s", preset_name, list(PRESET_FILE_MAP.keys()))
+    return None
+
+
+def append_image_references_to_preset(preset_name: str, trigger_index: int, filenames: List[str]) -> None:
+    preset_path = get_preset_file_path(preset_name)
+    if not preset_path:
+        raise FileNotFoundError(f"Не найден JSON-файл пресета {preset_name}.")
+
+    try:
+        data = json.loads(preset_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Не удалось прочитать {preset_path}: {exc}") from exc
+
+    triggers = data.setdefault("triggers", [])
+    if trigger_index >= len(triggers):
+        raise IndexError("Выбранный триггер не существует.")
+
+    trigger = triggers[trigger_index]
+    images = trigger.setdefault("images", [])
+    for filename in filenames:
+        if filename not in images:
+            images.append(filename)
+
+    preset_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def extract_keywords_from_phrase(phrase: str) -> List[str]:
+    keywords: List[str] = []
+    for raw_token in phrase.split():
+        token = raw_token.strip().lower()
+        if token and token not in keywords:
+            keywords.append(token)
+    return keywords
+
+
+def update_trigger_phrase_in_preset(preset_name: str, trigger_index: int, new_phrase: str) -> None:
+    preset_path = get_preset_file_path(preset_name)
+    if not preset_path:
+        raise FileNotFoundError(f"Не найден JSON-файл пресета {preset_name}.")
+
+    try:
+        data = json.loads(preset_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Не удалось прочитать {preset_path}: {exc}") from exc
+
+    triggers = data.setdefault("triggers", [])
+    if trigger_index < 0 or trigger_index >= len(triggers):
+        raise IndexError("Выбранный триггер не существует.")
+
+    triggers[trigger_index]["phrase"] = new_phrase
+    new_keywords = extract_keywords_from_phrase(new_phrase)
+    if new_keywords:
+        triggers[trigger_index]["keywords"] = new_keywords
+    preset_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def remove_image_from_trigger(preset_name: str, trigger_index: int, image_index: int) -> str:
+    preset_path = get_preset_file_path(preset_name)
+    if not preset_path:
+        raise FileNotFoundError(f"Не найден JSON-файл пресета {preset_name}.")
+
+    try:
+        data = json.loads(preset_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Не удалось прочитать {preset_path}: {exc}") from exc
+
+    triggers = data.get("triggers", [])
+    if trigger_index < 0 or trigger_index >= len(triggers):
+        raise IndexError("Выбранный триггер не существует.")
+
+    images = triggers[trigger_index].get("images", [])
+    if image_index < 0 or image_index >= len(images):
+        raise IndexError("Выбранной картинки нет в триггере.")
+
+    removed = images.pop(image_index)
+    preset_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return removed
+
+
+def build_unique_destination(preset_name: str, extension: str, *, base_suffix: Optional[str] = None) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = sanitize_suffix(base_suffix) if base_suffix else ""
+    base_name = f"{preset_name}_{timestamp}{f'_{suffix}' if suffix else ''}"
+    destination = PRESETS_DIR / f"{base_name}{extension}"
+    counter = 1
+    while destination.exists():
+        destination = PRESETS_DIR / f"{base_name}_{counter}{extension}"
+        counter += 1
+    return destination
+
+
+def sanitize_suffix(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+    cleaned = cleaned.strip("_")
+    return cleaned or "file"
+
+
+def compute_file_hash_from_path(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_existing_image_hashes() -> Dict[str, str]:
+    hashes: Dict[str, str] = {}
+    if not PRESETS_DIR.exists():
+        return hashes
+    for file_path in PRESETS_DIR.iterdir():
+        if file_path.is_file() and file_path.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS:
+            try:
+                hashes[compute_file_hash_from_path(file_path)] = file_path.name
+            except OSError as exc:
+                logger.warning("Не удалось вычислить хеш для %s: %s", file_path, exc)
+    return hashes
+
+
+async def save_single_image(
+    telegram_file,
+    preset_name: str,
+    extension: str,
+    base_suffix: Optional[str],
+    existing_hashes: Dict[str, str],
+) -> Tuple[List[str], List[str]]:
+    saved_files: List[str] = []
+    skipped: List[str] = []
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        temp_path = Path(tmp_dir) / "upload"
+        await telegram_file.download_to_drive(custom_path=str(temp_path))
+        file_hash = compute_file_hash_from_path(temp_path)
+        if file_hash in existing_hashes:
+            skipped.append(existing_hashes[file_hash])
+            return saved_files, skipped
+
+        destination = build_unique_destination(preset_name, extension, base_suffix=base_suffix)
+        shutil.move(str(temp_path), destination)
+        saved_files.append(destination.name)
+        existing_hashes[file_hash] = destination.name
+    return saved_files, skipped
+
+
+async def save_images_from_zip(
+    telegram_file,
+    preset_name: str,
+    existing_hashes: Dict[str, str],
+) -> Tuple[List[str], List[str]]:
+    saved_files: List[str] = []
+    skipped: List[str] = []
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        archive_path = Path(tmp_dir) / "upload.zip"
+        await telegram_file.download_to_drive(custom_path=str(archive_path))
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                for index, info in enumerate(archive.infolist(), start=1):
+                    if info.is_dir():
+                        continue
+                    inner_path = Path(info.filename)
+                    extension = inner_path.suffix.lower()
+                    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+                        continue
+                    suffix = f"zip_{index}_{inner_path.stem[:20]}"
+                    temp_file = Path(tmp_dir) / f"entry_{index}"
+                    digest = sha256()
+                    with archive.open(info) as source, temp_file.open("wb") as target:
+                        while True:
+                            chunk = source.read(65536)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            target.write(chunk)
+                    file_hash = digest.hexdigest()
+                    if file_hash in existing_hashes:
+                        skipped.append(existing_hashes[file_hash])
+                        temp_file.unlink(missing_ok=True)
+                        continue
+                    destination = build_unique_destination(
+                        preset_name,
+                        extension,
+                        base_suffix=suffix,
+                    )
+                    shutil.move(str(temp_file), destination)
+                    saved_files.append(destination.name)
+                    existing_hashes[file_hash] = destination.name
+        except zipfile.BadZipFile as exc:
+            raise ValueError("Не удалось распаковать ZIP-архив. Проверьте файл.") from exc
+
+    return saved_files, skipped
+
+
+def admin_panel_text() -> str:
+    return (
+        "Панель администрирования:\n"
+        "Выберите действие из списка или используйте /-команды."
+    )
+
+
+def build_admin_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("ℹ️ /start", callback_data="admin_panel:start")],
+            [InlineKeyboardButton("❓ /help", callback_data="admin_panel:help")],
+            [InlineKeyboardButton("📋 /list_presets", callback_data="admin_panel:list_presets")],
+            [InlineKeyboardButton("🔄 /reload_presets", callback_data="admin_panel:reload_presets")],
+            [InlineKeyboardButton("📌 /apply_preset", callback_data="admin_panel:apply_preset")],
+            [InlineKeyboardButton("📂 /show_state", callback_data="admin_panel:show_state")],
+            [InlineKeyboardButton("🛠 /debug_status", callback_data="admin_panel:debug_status")],
+            [InlineKeyboardButton("💬 /debug_chat", callback_data="admin_panel:debug_chat")],
+            [InlineKeyboardButton("🧩 /list_triggers", callback_data="admin_panel:list_triggers")],
+            [InlineKeyboardButton("🖼 Управление картинками", callback_data="admin_panel:images")],
+        ]
+    )
+
+
+def build_back_to_admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В главное меню", callback_data="admin_panel:menu")]])
+
+
 def build_admin_images_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🖼 Загрузить пресет", callback_data="admin_presets:upload")],
             [InlineKeyboardButton("📋 Список пресетов", callback_data="admin_presets:list")],
+            [InlineKeyboardButton("📷 Просмотреть картинки", callback_data="admin_presets:view_images")],
+            [InlineKeyboardButton("✏️ Переименовать триггер", callback_data="admin_presets:edit_trigger")],
+            [InlineKeyboardButton("🗑 Удалить картинку", callback_data="admin_presets:delete_image")],
             [InlineKeyboardButton("🗑 Удалить пресет", callback_data="admin_presets:delete")],
-            [InlineKeyboardButton("🔙 Назад / Выход", callback_data="admin_presets:exit")],
+            [InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_presets:exit")],
         ]
     )
 
 
-def build_files_keyboard(action: str, files: List[Path], *, use_index_labels: bool = False) -> InlineKeyboardMarkup:
+def build_back_to_presets_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_presets:menu")]])
+
+
+def build_presets_selection_keyboard(action: str, preset_names: List[str]) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(name, callback_data=f"{action}:{name}")] for name in preset_names]
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_presets:menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_presets_delete_keyboard(preset_names: List[str]) -> InlineKeyboardMarkup:
     buttons = [
-        [
-            InlineKeyboardButton(
-                f"🖼 {index + 1}" if use_index_labels else f"📂 {file_path.name}",
-                callback_data=f"{action}:{file_path.name}",
-            )
-        ]
-        for index, file_path in enumerate(files)
+        [InlineKeyboardButton(f"🗑 {name}", callback_data=f"admin_presets:delete_confirm:{name}")]
+        for name in preset_names
     ]
     buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_presets:menu")])
     return InlineKeyboardMarkup(buttons)
 
 
-def build_back_to_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_presets:menu")]])
+def build_image_files_keyboard(action: str, file_names: List[str]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(f"🖼 {name}", callback_data=f"{action}:{index}")]
+        for index, name in enumerate(file_names)
+    ]
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_presets:menu")])
+    return InlineKeyboardMarkup(buttons)
 
+
+def build_triggers_selection_keyboard(
+    preset_name: str,
+    preset: Dict[str, Any],
+    *,
+    action_prefix: str = "upload_trigger",
+    back_callback: str = "admin_presets:upload",
+) -> InlineKeyboardMarkup:
+    trigger_buttons: List[List[InlineKeyboardButton]] = []
+    for index, trigger in enumerate(preset.get("triggers", [])):
+        phrase = str(trigger.get("phrase") or "").strip()
+        keywords = [str(keyword).strip() for keyword in trigger.get("keywords", []) if str(keyword).strip()]
+        label = phrase or (", ".join(keywords[:3]) + ("…" if len(keywords) > 3 else ""))
+        if not label:
+            label = f"Триггер {index + 1}"
+        trigger_buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{index + 1}. {label}",
+                    callback_data=f"admin_presets:{action_prefix}:{preset_name}:{index}",
+                )
+            ]
+        )
+
+    if not trigger_buttons:
+        trigger_buttons.append([InlineKeyboardButton("Нет триггеров", callback_data="admin_presets:menu")])
+
+    trigger_buttons.append([InlineKeyboardButton("🔙 Назад", callback_data=back_callback)])
+    return InlineKeyboardMarkup(trigger_buttons)
+
+
+def build_trigger_images_keyboard(
+    preset_name: str,
+    trigger_index: int,
+    images: List[str],
+    *,
+    action_prefix: str,
+    back_callback: str,
+) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"🗑 {image_name}",
+                callback_data=f"admin_presets:{action_prefix}:{preset_name}:{trigger_index}:{index}",
+            )
+        ]
+        for index, image_name in enumerate(images)
+    ]
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data=back_callback)])
+    return InlineKeyboardMarkup(buttons)
 
 def list_preset_files() -> List[Path]:
     ensure_presets_directory()
-    allowed = {".jpg", ".jpeg", ".png", ".webp"}
     return sorted(
         file_path
         for file_path in PRESETS_DIR.iterdir()
-        if file_path.is_file() and file_path.suffix.lower() in allowed
+        if file_path.is_file() and file_path.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS
     )
+
+def list_image_files() -> List[Path]:
+    """Deprecated helper preserved for backward compatibility."""
+    return list_preset_files()
+
+
+def image_is_referenced(image_name: str, presets: Dict[str, Dict[str, Any]]) -> bool:
+    for preset in presets.values():
+        for trigger in preset.get("triggers", []):
+            images = [str(ref) for ref in trigger.get("images", []) if isinstance(ref, str)]
+            if image_name in images:
+                return True
+    return False
+
+async def show_admin_main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit: bool = False,
+    answer_callback: bool = True,
+) -> None:
+    keyboard = build_admin_main_keyboard()
+    text = admin_panel_text()
+    context.user_data.pop("admin_panel_pending", None)
+
+    if edit and update.callback_query and update.callback_query.message:
+        await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+        context.user_data["admin_panel_message_id"] = update.callback_query.message.message_id
+        if answer_callback:
+            await update.callback_query.answer()
+    else:
+        sent = await update.effective_message.reply_text(text, reply_markup=keyboard)
+        context.user_data["admin_panel_message_id"] = sent.message_id
+
+
+async def restore_admin_main_menu_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message_id = context.user_data.get("admin_panel_message_id")
+    if chat and message_id:
+        try:
+            await context.bot.edit_message_text(
+                admin_panel_text(),
+                chat_id=chat.id,
+                message_id=message_id,
+                reply_markup=build_admin_main_keyboard(),
+            )
+            context.user_data["admin_panel_message_id"] = message_id
+            context.user_data.pop("admin_panel_pending", None)
+            return
+        except Exception as exc:
+            logger.debug("Failed to edit admin panel message %s: %s", message_id, exc)
+
+    sent = await update.effective_message.reply_text(admin_panel_text(), reply_markup=build_admin_main_keyboard())
+    context.user_data["admin_panel_message_id"] = sent.message_id
 
 
 async def ensure_admin_panel_access(update: Update) -> bool:
@@ -405,8 +755,93 @@ async def cmd_admin_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await ensure_admin_panel_access(update):
         return
 
-    logger.info("Admin %s opened image admin panel.", update.effective_user.id if update.effective_user else "unknown")
-    await show_admin_presets_menu(update, context)
+    logger.info("Admin %s opened admin panel.", update.effective_user.id if update.effective_user else "unknown")
+    await show_admin_main_menu(update, context)
+
+
+async def invoke_command(handler, update: Update, context: ContextTypes.DEFAULT_TYPE, args: Optional[List[str]] = None) -> None:
+    current_args = getattr(context, "args", None)
+    previous_args = list(current_args) if current_args else []
+    try:
+        context.args = args or []
+        await handler(update, context)
+    finally:
+        context.args = previous_args
+
+
+async def handle_admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin_panel_access(update):
+        return
+
+    query = update.callback_query
+    if not query:
+        return
+
+    data = query.data or ""
+    parts = data.split(":", 1)
+    if len(parts) != 2 or parts[0] != "admin_panel":
+        await query.answer()
+        return
+
+    action = parts[1]
+    logger.debug("Admin %s triggered admin panel action %s.", update.effective_user.id if update.effective_user else "unknown", action)
+
+    if action == "menu":
+        await show_admin_main_menu(update, context, edit=True, answer_callback=False)
+        await query.answer("Главное меню обновлено.")
+        return
+
+    if action == "images":
+        context.user_data.pop("admin_panel_pending", None)
+        await show_admin_presets_menu(update, context, edit=True)
+        return
+
+    simple_command_handlers = {
+        "start": cmd_start,
+        "help": cmd_help,
+        "list_presets": cmd_list_presets,
+        "reload_presets": cmd_reload_presets,
+        "show_state": cmd_show_state,
+        "debug_status": cmd_debug_status,
+    }
+
+    if action in simple_command_handlers:
+        await invoke_command(simple_command_handlers[action], update, context)
+        await show_admin_main_menu(update, context, edit=True, answer_callback=False)
+        await query.answer("Команда выполнена.")
+        return
+
+    if action == "list_triggers":
+        context.user_data["admin_panel_pending"] = {"action": "list_triggers"}
+        await query.message.edit_text(
+            "Введите имя пресета, триггеры которого хотите посмотреть:",
+            reply_markup=build_back_to_admin_panel_keyboard(),
+        )
+        context.user_data["admin_panel_message_id"] = query.message.message_id
+        await query.answer("Ожидаю имя пресета.")
+        return
+
+    if action == "apply_preset":
+        context.user_data["admin_panel_pending"] = {"action": "apply_preset"}
+        await query.message.edit_text(
+            "Введите chat_id и имя пресета через пробел.\nПример: -100123456789 anya_redko",
+            reply_markup=build_back_to_admin_panel_keyboard(),
+        )
+        context.user_data["admin_panel_message_id"] = query.message.message_id
+        await query.answer("Ожидаю параметры для назначения пресета.")
+        return
+
+    if action == "debug_chat":
+        context.user_data["admin_panel_pending"] = {"action": "debug_chat"}
+        await query.message.edit_text(
+            "Введите chat_id, по которому нужна диагностика:",
+            reply_markup=build_back_to_admin_panel_keyboard(),
+        )
+        context.user_data["admin_panel_message_id"] = query.message.message_id
+        await query.answer("Ожидаю chat_id.")
+        return
+
+    await query.answer()
 
 
 async def handle_admin_presets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -420,48 +855,381 @@ async def handle_admin_presets_callback(update: Update, context: ContextTypes.DE
     data = query.data or ""
     logger.debug("Admin %s triggered callback %s.", update.effective_user.id if update.effective_user else "unknown", data)
 
-    if data in {"admin_presets:menu", "admin_presets:exit"}:
+    if data == "admin_presets:menu":
         await show_admin_presets_menu(update, context, edit=True)
         return
 
+    if data == "admin_presets:exit":
+        await show_admin_main_menu(update, context, edit=True)
+        return
+
     if data == "admin_presets:upload":
-        context.user_data["awaiting_preset_upload"] = True
+        presets = context.bot_data.setdefault("presets", {})
+        context.user_data.pop("awaiting_preset_upload", None)
+        if not presets:
+            await query.message.edit_text(
+                "Сначала добавьте JSON-пресеты и выполните /obnovit_presets.",
+                reply_markup=build_back_to_presets_menu_keyboard(),
+            )
+            await query.answer()
+            return
+
+        keyboard = build_presets_selection_keyboard("admin_presets:upload_preset", sorted(presets.keys()))
         await query.message.edit_text(
-            "Отправьте изображение (фото или файл). После загрузки оно появится в папке presets/.",
-            reply_markup=build_back_to_menu_keyboard(),
+            "Выберите пресет, к которому нужно добавить картинку:",
+            reply_markup=keyboard,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("admin_presets:upload_preset:"):
+        _, _, preset_name = data.split(":", 2)
+        presets = context.bot_data.setdefault("presets", {})
+        preset = presets.get(preset_name)
+        if not preset:
+            await query.answer("Пресет не найден.", show_alert=True)
+            return
+
+        if not preset.get("triggers"):
+            await query.message.edit_text(
+                "В этом пресете нет триггеров. Добавьте их вручную в JSON-файл.",
+                reply_markup=build_back_to_presets_menu_keyboard(),
+            )
+            await query.answer()
+            return
+
+        keyboard = build_triggers_selection_keyboard(preset_name, preset)
+        await query.message.edit_text(
+            f"Выбран пресет {preset_name}. Теперь выберите триггер:",
+            reply_markup=keyboard,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("admin_presets:upload_trigger:"):
+        _, _, preset_name, trigger_index_str = data.split(":", 3)
+        presets = context.bot_data.setdefault("presets", {})
+        preset = presets.get(preset_name)
+        if not preset:
+            await query.answer("Пресет не найден.", show_alert=True)
+            return
+
+        try:
+            trigger_index = int(trigger_index_str)
+        except ValueError:
+            await query.answer("Некорректный номер триггера.", show_alert=True)
+            return
+
+        triggers = preset.get("triggers", [])
+        if trigger_index < 0 or trigger_index >= len(triggers):
+            await query.answer("Такого триггера нет.", show_alert=True)
+            return
+
+        context.user_data["awaiting_preset_upload"] = {
+            "preset_name": preset_name,
+            "trigger_index": trigger_index,
+        }
+        await query.message.edit_text(
+            f"Отправьте изображение для добавления в пресет «{preset_name}».\n"
+            "Можно прислать фото или файл формата JPG/PNG/WebP.",
+            reply_markup=build_back_to_presets_menu_keyboard(),
         )
         await query.answer()
         return
 
     if data == "admin_presets:list":
-        logger.debug("Admin %s requested file list for viewing.", update.effective_user.id if update.effective_user else "unknown")
-        files = list_preset_files()
-        if not files:
+        presets = context.bot_data.setdefault("presets", {})
+        if not presets:
             await query.message.edit_text(
-                "В папке presets пока нет файлов.",
-                reply_markup=build_back_to_menu_keyboard(),
+                "Пресеты не найдены. Добавьте JSON-файлы и выполните /obnovit_presets.",
+                reply_markup=build_back_to_presets_menu_keyboard(),
             )
             await query.answer()
             return
 
+        lines = []
+        for preset_name, preset in presets.items():
+            description = preset.get("description")
+            lines.append(f"- {preset_name}" + (f" ({description})" if description else ""))
+
         await query.message.edit_text(
-            "Сохранённые пресеты:\nНажмите на кнопку, чтобы посмотреть изображение.",
-            reply_markup=build_files_keyboard("admin_presets:view", files, use_index_labels=True),
+            "Доступные пресеты:\n" + "\n".join(lines),
+            reply_markup=build_back_to_presets_menu_keyboard(),
         )
         await query.answer()
         return
 
-    if data.startswith("admin_presets:view:"):
-        filename = data.split(":", 2)[2]
+    if data == "admin_presets:view_images":
+        files = list_preset_files()
+        if not files:
+            await query.message.edit_text(
+                "В папке presets пока нет изображений.",
+                reply_markup=build_back_to_presets_menu_keyboard(),
+            )
+            await query.answer()
+            return
+
+        file_names = [file_path.name for file_path in files]
+        context.user_data["image_gallery"] = file_names
+
+        await query.message.edit_text(
+            "Выберите картинку для просмотра:",
+            reply_markup=build_image_files_keyboard("admin_presets:view_file_idx", file_names),
+        )
+        await query.answer()
+        return
+
+    if data == "admin_presets:edit_trigger":
+        presets = context.bot_data.setdefault("presets", {})
+        if not presets:
+            await query.message.edit_text(
+                "Пресеты не найдены. Добавьте JSON-файлы и выполните /obnovit_presets.",
+                reply_markup=build_back_to_presets_menu_keyboard(),
+            )
+            await query.answer()
+            return
+
+        keyboard = build_presets_selection_keyboard("admin_presets:edit_preset", sorted(presets.keys()))
+        await query.message.edit_text(
+            "Выберите пресет, где хотите изменить фразу-триггер:",
+            reply_markup=keyboard,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("admin_presets:edit_preset:"):
+        _, _, preset_name = data.split(":", 2)
+        presets = context.bot_data.setdefault("presets", {})
+        preset = presets.get(preset_name)
+        if not preset:
+            await query.answer("Пресет не найден.", show_alert=True)
+            return
+
+        keyboard = build_triggers_selection_keyboard(
+            preset_name,
+            preset,
+            action_prefix="edit_trigger_select",
+            back_callback="admin_presets:edit_trigger",
+        )
+        await query.message.edit_text(
+            f"Пресет {preset_name}. Выберите триггер для изменения:",
+            reply_markup=keyboard,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("admin_presets:edit_trigger_select:"):
+        parts = data.split(":", 3)
+        if len(parts) != 4:
+            await query.answer("Некорректный параметр.", show_alert=True)
+            return
+        _, _, preset_name, trigger_index_str = parts
+        presets = context.bot_data.setdefault("presets", {})
+        preset = presets.get(preset_name)
+        if not preset:
+            await query.answer("Пресет не найден.", show_alert=True)
+            return
+
+        try:
+            trigger_index = int(trigger_index_str)
+        except ValueError:
+            await query.answer("Некорректный номер триггера.", show_alert=True)
+            return
+
+        triggers = preset.get("triggers", [])
+        if trigger_index < 0 or trigger_index >= len(triggers):
+            await query.answer("Такого триггера нет.", show_alert=True)
+            return
+
+        context.user_data["admin_panel_pending"] = {
+            "action": "edit_trigger_phrase",
+            "preset_name": preset_name,
+            "trigger_index": trigger_index,
+            "return_to": "admin_presets",
+        }
+        await query.message.edit_text(
+            f"Введите новую фразу для триггера №{trigger_index + 1} пресета «{preset_name}»:",
+            reply_markup=build_back_to_presets_menu_keyboard(),
+        )
+        context.user_data["admin_panel_message_id"] = query.message.message_id
+        await query.answer("Ожидаю новую фразу.")
+        return
+
+    if data == "admin_presets:delete_image":
+        presets = context.bot_data.setdefault("presets", {})
+        if not presets:
+            await query.message.edit_text(
+                "Пресеты не найдены. Добавьте JSON-файлы и выполните /obnovit_presets.",
+                reply_markup=build_back_to_presets_menu_keyboard(),
+            )
+            await query.answer()
+            return
+
+        keyboard = build_presets_selection_keyboard("admin_presets:delete_image_preset", sorted(presets.keys()))
+        await query.message.edit_text(
+            "Выберите пресет, из которого удаляем изображения:",
+            reply_markup=keyboard,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("admin_presets:delete_image_preset:"):
+        _, _, preset_name = data.split(":", 2)
+        presets = context.bot_data.setdefault("presets", {})
+        preset = presets.get(preset_name)
+        if not preset:
+            await query.answer("Пресет не найден.", show_alert=True)
+            return
+
+        keyboard = build_triggers_selection_keyboard(
+            preset_name,
+            preset,
+            action_prefix="delete_image_trigger",
+            back_callback="admin_presets:delete_image",
+        )
+        await query.message.edit_text(
+            f"Пресет {preset_name}. Выберите триггер, где нужно удалить картинку:",
+            reply_markup=keyboard,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("admin_presets:delete_image_trigger:"):
+        parts = data.split(":", 3)
+        if len(parts) != 4:
+            await query.answer("Некорректный параметр.", show_alert=True)
+            return
+        _, _, preset_name, trigger_index_str = parts
+        presets = context.bot_data.setdefault("presets", {})
+        preset = presets.get(preset_name)
+        if not preset:
+            await query.answer("Пресет не найден.", show_alert=True)
+            return
+
+        try:
+            trigger_index = int(trigger_index_str)
+        except ValueError:
+            await query.answer("Некорректный номер триггера.", show_alert=True)
+            return
+
+        triggers = preset.get("triggers", [])
+        if trigger_index < 0 or trigger_index >= len(triggers):
+            await query.answer("Такого триггера нет.", show_alert=True)
+            return
+
+        images = [str(image) for image in triggers[trigger_index].get("images", []) if isinstance(image, str)]
+        if not images:
+            await query.message.edit_text(
+                "В выбранном триггере нет картинок.",
+                reply_markup=build_triggers_selection_keyboard(
+                    preset_name,
+                    preset,
+                    action_prefix="delete_image_trigger",
+                    back_callback="admin_presets:delete_image",
+                ),
+            )
+            await query.answer()
+            return
+
+        keyboard = build_trigger_images_keyboard(
+            preset_name,
+            trigger_index,
+            images,
+            action_prefix="delete_image_file",
+            back_callback=f"admin_presets:delete_image_preset:{preset_name}",
+        )
+        await query.message.edit_text(
+            "Выберите картинку для удаления:",
+            reply_markup=keyboard,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("admin_presets:delete_image_file:"):
+        parts = data.split(":", 5)
+        if len(parts) != 5:
+            await query.answer("Некорректный параметр.", show_alert=True)
+            return
+        _, _, preset_name, trigger_index_str, image_index_str = parts
+        presets = context.bot_data.setdefault("presets", {})
+        preset = presets.get(preset_name)
+        if not preset:
+            await query.answer("Пресет не найден.", show_alert=True)
+            return
+
+        try:
+            trigger_index = int(trigger_index_str)
+            image_index = int(image_index_str)
+        except ValueError:
+            await query.answer("Некорректный индекс.", show_alert=True)
+            return
+
+        try:
+            removed_image = remove_image_from_trigger(preset_name, trigger_index, image_index)
+        except Exception as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+
+        presets = load_presets()
+        context.bot_data["presets"] = presets
+        if not image_is_referenced(removed_image, presets):
+            (PRESETS_DIR / removed_image).unlink(missing_ok=True)
+
+        preset = presets.get(preset_name)
+        trigger = preset.get("triggers", [])[trigger_index] if preset and trigger_index < len(preset.get("triggers", [])) else {}
+        images = [str(image) for image in trigger.get("images", []) if isinstance(image, str)]
+        if images:
+            keyboard = build_trigger_images_keyboard(
+                preset_name,
+                trigger_index,
+                images,
+                action_prefix="delete_image_file",
+                back_callback=f"admin_presets:delete_image_preset:{preset_name}",
+            )
+            await query.message.edit_text(
+                f"Удалено: {removed_image}\nВыберите следующую картинку для удаления:",
+                reply_markup=keyboard,
+            )
+        else:
+            keyboard = build_triggers_selection_keyboard(
+                preset_name,
+                preset or {},
+                action_prefix="delete_image_trigger",
+                back_callback="admin_presets:delete_image",
+            )
+            await query.message.edit_text(
+                f"Удалено: {removed_image}\nВ этом триггере больше нет картинок.",
+                reply_markup=keyboard,
+            )
+        await query.answer("Картинка удалена.")
+        return
+
+    if data.startswith("admin_presets:view_file_idx:"):
+        parts = data.split(":", 3)
+        if len(parts) < 3:
+            await query.answer("Некорректный параметр.", show_alert=True)
+            return
+        try:
+            index = int(parts[2])
+        except ValueError:
+            await query.answer("Некорректный индекс.", show_alert=True)
+            return
+
+        gallery = context.user_data.get("image_gallery", [])
+        if not gallery or index < 0 or index >= len(gallery):
+            await query.answer("Не удалось найти изображение.", show_alert=True)
+            return
+
+        filename = gallery[index]
         file_path = resolve_image_path(filename)
         if not file_path:
             await query.answer("Файл не найден.", show_alert=True)
             return
 
         with file_path.open("rb") as image_file:
-            await query.message.reply_photo(photo=image_file)
+            await query.message.reply_photo(photo=image_file, caption=filename)
         logger.info(
-            "Admin %s requested preset image %s.",
+            "Admin %s viewed preset image %s.",
             update.effective_user.id if update.effective_user else "unknown",
             file_path,
         )
@@ -469,45 +1237,54 @@ async def handle_admin_presets_callback(update: Update, context: ContextTypes.DE
         return
 
     if data == "admin_presets:delete":
-        logger.debug("Admin %s requested file list for deletion.", update.effective_user.id if update.effective_user else "unknown")
-        files = list_preset_files()
-        if not files:
+        presets = context.bot_data.setdefault("presets", {})
+        if not presets:
             await query.message.edit_text(
-                "Нет файлов для удаления.",
-                reply_markup=build_back_to_menu_keyboard(),
+                "Нет пресетов для удаления.",
+                reply_markup=build_back_to_presets_menu_keyboard(),
             )
             await query.answer()
             return
 
         await query.message.edit_text(
-            "Выберите картинку для удаления:",
-            reply_markup=build_files_keyboard("admin_presets:remove", files),
+            "Выберите пресет для удаления:",
+            reply_markup=build_presets_delete_keyboard(sorted(presets.keys())),
         )
         await query.answer()
         return
 
-    if data.startswith("admin_presets:remove:"):
-        filename = data.split(":", 2)[2]
-        file_path = resolve_image_path(filename)
-        if not file_path:
-            await query.answer("Файл не найден.", show_alert=True)
+    if data.startswith("admin_presets:delete_confirm:"):
+        _, _, preset_name = data.split(":", 2)
+        preset_path = get_preset_file_path(preset_name)
+        if not preset_path:
+            await query.answer("Файл пресета не найден.", show_alert=True)
             return
 
         try:
-            file_path.unlink()
+            preset_path.unlink()
         except OSError as exc:
-            await query.answer(f"Не удалось удалить файл: {exc}", show_alert=True)
+            await query.answer(f"Не удалось удалить пресет: {exc}", show_alert=True)
             return
 
+        presets = load_presets()
+        context.bot_data["presets"] = presets
+
+        state = context.bot_data.setdefault("state", {})
+        removed_chats = [chat_id for chat_id, assigned in state.items() if assigned == preset_name]
+        for chat_id in removed_chats:
+            del state[chat_id]
+        if removed_chats:
+            save_state(state)
+
         await query.message.edit_text(
-            f"🗑 Пресет {filename} удалён.",
+            f"🗑 Пресет {preset_name} удалён."
+            + (f" Удалены назначения для чатов: {', '.join(removed_chats)}" if removed_chats else ""),
             reply_markup=build_admin_images_keyboard(),
         )
-        context.user_data.pop("awaiting_preset_upload", None)
         logger.info(
-            "Admin %s deleted preset image %s.",
+            "Admin %s deleted preset %s.",
             update.effective_user.id if update.effective_user else "unknown",
-            file_path,
+            preset_name,
         )
         await query.answer()
         return
@@ -516,7 +1293,8 @@ async def handle_admin_presets_callback(update: Update, context: ContextTypes.DE
 
 
 async def handle_admin_image_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.user_data.get("awaiting_preset_upload"):
+    upload_context = context.user_data.get("awaiting_preset_upload")
+    if not upload_context:
         return
 
     if not await ensure_admin_panel_access(update):
@@ -527,36 +1305,162 @@ async def handle_admin_image_upload(update: Update, context: ContextTypes.DEFAUL
         return
 
     ensure_presets_directory()
-    filename = f"preset_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
-    destination = PRESETS_DIR / filename
-
-    telegram_file = None
-    if message.photo:
-        telegram_file = await message.photo[-1].get_file()
-    elif message.document and (
-        (message.document.mime_type and message.document.mime_type.startswith("image/"))
-        or (message.document.file_name and message.document.file_name.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")))
-    ):
-        telegram_file = await message.document.get_file()
-
-    if not telegram_file:
-        await message.reply_text("⚠️ Пожалуйста, отправьте изображение (фото или файл).")
+    existing_hashes = build_existing_image_hashes()
+    preset_name = upload_context.get("preset_name")
+    trigger_index = upload_context.get("trigger_index")
+    if preset_name is None or trigger_index is None:
+        context.user_data.pop("awaiting_preset_upload", None)
+        await message.reply_text("Возникла ошибка при выборе пресета. Попробуйте начать заново.")
         return
 
-    await telegram_file.download_to_drive(custom_path=str(destination))
+    telegram_file = None
+    is_archive = False
+    extension = ".jpg"
+    base_suffix: Optional[str] = None
+
+    if message.photo:
+        telegram_file = await message.photo[-1].get_file()
+    elif message.document:
+        doc = message.document
+        telegram_file = await doc.get_file()
+        file_name = doc.file_name or ""
+        base_suffix = Path(file_name).stem if file_name else None
+        ext = Path(file_name).suffix.lower()
+        mime = (doc.mime_type or "").lower()
+        if ext in ALLOWED_ARCHIVE_EXTENSIONS or "zip" in mime:
+            is_archive = True
+        elif ext in ALLOWED_IMAGE_EXTENSIONS:
+            extension = ext
+        elif telegram_file and telegram_file.file_path:
+            _, inferred_ext = os.path.splitext(telegram_file.file_path)
+            inferred_ext = inferred_ext.lower()
+            if inferred_ext in ALLOWED_IMAGE_EXTENSIONS:
+                extension = inferred_ext
+    elif message.document is None and message.photo is None:
+        telegram_file = None
+
+    if not telegram_file:
+        await message.reply_text("⚠️ Пожалуйста, отправьте изображение (фото или файл) или ZIP-архив с изображениями.")
+        return
+
+    saved_filenames: List[str] = []
+    skipped_duplicates: List[str] = []
+    if is_archive:
+        try:
+            saved_filenames, skipped_duplicates = await save_images_from_zip(telegram_file, preset_name, existing_hashes)
+        except ValueError as exc:
+            await message.reply_text(f"❌ {exc}")
+            return
+
+        if not saved_filenames:
+            if skipped_duplicates:
+                await message.reply_text("⚠️ Все изображения из архива уже есть среди загруженных и были пропущены.")
+            else:
+                await message.reply_text("⚠️ В архиве не найдено подходящих изображений (JPG/PNG/WebP/GIF).")
+            return
+    else:
+        saved_filenames, skipped_duplicates = await save_single_image(
+            telegram_file,
+            preset_name,
+            extension,
+            base_suffix,
+            existing_hashes,
+        )
+        if not saved_filenames:
+            await message.reply_text("⚠️ Это изображение уже загружено ранее и было пропущено.")
+            return
+
+    try:
+        append_image_references_to_preset(preset_name, int(trigger_index), saved_filenames)
+        context.bot_data["presets"] = load_presets()
+    except Exception as exc:
+        for filename in saved_filenames:
+            (PRESETS_DIR / filename).unlink(missing_ok=True)
+        logger.exception("Failed to attach uploaded image(s) to preset %s: %s", preset_name, exc)
+        await message.reply_text(f"❌ Не удалось обновить пресет: {exc}")
+        return
+
     context.user_data.pop("awaiting_preset_upload", None)
 
     logger.info(
-        "Admin %s uploaded new preset image %s.",
+        "Admin %s uploaded %d preset image(s) %s.",
         update.effective_user.id if update.effective_user else "unknown",
-        destination,
+        len(saved_filenames),
+        saved_filenames,
     )
 
-    await message.reply_text(f"✅ Картинка сохранена в presets/ как {destination.name}.")
+    duplicate_note = ""
+    if skipped_duplicates:
+        duplicate_note = f"\nПропущено дубликатов: {len(skipped_duplicates)}"
+
+    await message.reply_text(
+        "✅ Картинки загружены и привязаны к выбранному триггеру.\n"
+        f"Файлы: {', '.join(saved_filenames)}{duplicate_note}"
+    )
     await message.reply_text(
         "Возвращаю вас в меню админки:",
         reply_markup=build_admin_images_keyboard(),
     )
+
+
+async def handle_admin_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = context.user_data.get("admin_panel_pending")
+    if not pending:
+        return
+
+    if not await ensure_admin_panel_access(update):
+        return
+
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text:
+        await message.reply_text("Введите текстовое значение.")
+        return
+
+    action = pending.get("action")
+    restore_main_menu = True
+    if action == "apply_preset":
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            await message.reply_text("Нужно указать chat_id и имя пресета через пробел.")
+            return
+        await invoke_command(cmd_apply_preset, update, context, args=parts)
+    elif action == "debug_chat":
+        await invoke_command(cmd_debug_chat, update, context, args=[text])
+    elif action == "list_triggers":
+        await invoke_command(cmd_list_triggers, update, context, args=[text])
+    elif action == "edit_trigger_phrase":
+        preset_name = pending.get("preset_name")
+        trigger_index = pending.get("trigger_index")
+        if preset_name is None or trigger_index is None:
+            await message.reply_text("Не удалось определить пресет или триггер. Попробуйте заново.")
+            return
+
+        try:
+            update_trigger_phrase_in_preset(preset_name, int(trigger_index), text)
+        except Exception as exc:
+            await message.reply_text(f"Не удалось обновить триггер: {exc}")
+            return
+
+        context.bot_data["presets"] = load_presets()
+        await message.reply_text(
+            f"✅ Триггер пресета «{preset_name}» обновлён.\nНовая фраза: {text}"
+        )
+        if pending.get("return_to") == "admin_presets":
+            restore_main_menu = False
+            await message.reply_text(
+                "Возвращаю вас в меню управления пресетами:",
+                reply_markup=build_admin_images_keyboard(),
+            )
+    else:
+        return
+
+    context.user_data.pop("admin_panel_pending", None)
+    if restore_main_menu:
+        await restore_admin_main_menu_from_text(update, context)
 
 
 async def handle_admin_non_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -901,11 +1805,18 @@ def build_application() -> Application:
     application.add_handler(CommandHandler(command_with_aliases(CMD_DEBUG_CHAT), cmd_debug_chat))
     application.add_handler(CommandHandler(command_with_aliases(CMD_LIST_TRIGGERS), cmd_list_triggers))
     application.add_handler(CommandHandler(command_with_aliases(CMD_ADMIN_IMAGES), cmd_admin_images))
+    application.add_handler(CallbackQueryHandler(handle_admin_panel_callback, pattern=r"^admin_panel:"))
     application.add_handler(CallbackQueryHandler(handle_admin_presets_callback, pattern=r"^admin_presets:"))
     application.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.IMAGE),
+            filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.ALL),
             handle_admin_image_upload,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & (~filters.COMMAND),
+            handle_admin_panel_text,
         )
     )
     application.add_handler(
